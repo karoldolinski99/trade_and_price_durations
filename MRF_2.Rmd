@@ -1,0 +1,211 @@
+---
+title: "<center>Transakcyjne i cenowe czasy trwania</center>"
+output: 
+    html_document:
+          code_folding: hide
+          toc: true
+          toc_float: true
+          number_sections: true
+          css: style.css
+---
+
+<center>
+Karol Doliński
+
+Informatyka i Ekonometria
+</center>
+
+```{r setup, include=FALSE}
+#options(scipen=999)
+knitr::opts_chunk$set(
+ fig.width = 6,
+ fig.asp = 0.9,
+ out.width = "100%"
+)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(ACDm)
+library(ggplot2)
+library(forecast)
+library(lubridate)
+library(stringr)
+library(tidyverse)
+library(zoo)
+
+df_1 <- read.csv("dane1.csv", sep = ";")
+df_2 <- read.csv("dane2.csv", sep = ";")
+df_3 <- read.csv("dane3.csv", sep = ";")
+df <- rbind.data.frame(df_1, df_2, df_3)
+colnames(df) <- c("date", "name", "hour", "price", "volume")
+df_pge <- as_tibble(df %>% filter(name == "PGE"))
+df_pgnig <- as_tibble(df %>% filter(name == "PGNIG"))
+```
+
+-----
+
+# Wprowadzenie
+
+Tematem niniejszego projektu jest analiza transakcyjnych i cenowych czasów trwania. W pracy skupiono się na zbadaniu występowania śróddziennej sezonowości transakcyjnych czasów trwania, a także na zaproponowaniu metody usuwania śróddziennej sezonowości. Omówiono również zależności dla cenowych czasów trwania dla wybranych spółek akcyjnych: PGE i PGNiG.
+
+Wykorzystane w pracy dane dotyczą okresu od 4 stycznia 2016 roku do 15 lutego 2016 roku. Zbiór danych dotyczy śróddziennych notowań dla dwóch spółek z indeksu WIG20: PGE i PGNiG. Dane przedstawiają wartości od godziny 09:00 do 16:50 (czas notowań ciągłych). 
+
+-----
+
+# Transakcyjne czasy trwania
+
+Badanie rozpoczęto od skonstruowania szeregu czasowego transakcyjnych czasów trwania. W przypadku, gdy o tej samej godzinie (z dokładnością co do sekundy) zostało zawartych kilka transakcji, to połączono je w jedną, przy czym cena wyznaczono jako średnią ważoną cen poszczególnych transakcji, gdzie wagami były ich wolumeny. Następnie zbadano występowanie śróddziennej sezonowości za pomocą przekrojowych średnich (na przestrzeni sesji giełdowej) transakcyjnych czasów trwania w badanym okresie. Średnie czasy trwania zostały wyznaczone w interwałach 5-minutowych. 
+
+```{r echo=TRUE, fig.align='center', message=FALSE, warning=FALSE, out.width="75%", results='hide', fig.keep='all'}
+data_preprocessing <- function(dataset){
+  dataset <- dataset %>% mutate(time = paste(date, hour, sep = " "))
+  dataset["time"] <- ymd_hms(dataset$time)
+  dataset$date <- ymd(dataset$date)
+  dataset <- dataset[order(dataset$time),]
+  return(dataset)
+}
+
+df_pge <- data_preprocessing(df_pge)
+df_pgnig <- data_preprocessing(df_pgnig)
+
+df_pge_time_duration <- computeDurations(df_pge, open = "09:00:00", close = "16:49:59", rm0dur = TRUE, type = "trade")
+df_pgnig_time_duration <- computeDurations(df_pgnig, open = "09:00:00", close = "16:49:59", rm0dur = TRUE, type = "trade")
+
+df_pge_time_duration["Interval"] <- floor_date(df_pge_time_duration$time, unit = "5 min")
+df_pgnig_time_duration["Interval"] <- floor_date(df_pgnig_time_duration$time, unit = "5 min")
+
+df_pge_time_duration["Interval"] <- str_sub(as.character(df_pge_time_duration$Interval), -8, -1)
+df_pgnig_time_duration["Interval"] <- str_sub(as.character(df_pgnig_time_duration$Interval), -8, -1)
+
+df_pge_time_duration_means <- df_pge_time_duration %>% group_by(Interval) %>%
+  summarise(MeanTimeDurations = sum(durations) / sum(Ntrans))
+df_pgnig_time_duration_means <- df_pgnig_time_duration %>% group_by(Interval) %>%
+  summarise(MeanTimeDurations = sum(durations) / sum(Ntrans))
+
+df_pge_time_duration_means["name"] <- 'PGE'
+df_pgnig_time_duration_means["name"] <- 'PGNIG'
+df_time_duration_means <- rbind(df_pge_time_duration_means, df_pgnig_time_duration_means)
+
+df_time_duration_means %>%
+  ggplot(aes(x = Interval, y = MeanTimeDurations, group = name, color = name)) +
+  geom_line() + 
+  ggtitle("Średni transakcyjny czas trwania") + 
+  xlab("Godzina") + 
+  ylab("Czas trwania [sek.]") + 
+  labs(color="Spółka") +
+  geom_hline(yintercept=0, linetype="solid", color = "black", alpha=0.5) +
+  scale_x_discrete(breaks = c('10:00:00', '12:00:00', '14:00:00', '16:00:00')) + 
+  theme_bw() + 
+  theme(legend.position = "none") +
+  facet_grid(factor(name)~.)
+```
+Dla obu spółek można zauważyć występowanie śróddziennej sezonowości czasów trwania. Na początku i na końcu sesji czasy te są najkrótsze, czyli innymi słowy w tych okresach czas pomiędzy kolejno zawieranymi transakcjami jest najmniejszy. Dla spółki PGE transakcje zaraz po otwarciu są zawierane średnio co 5 sekund, a od 16:45 do 16:50 jest to około 7 sekund. Czasy te są podobne w przypadku PGNIG. Z kolei najrzadziej zawierane są transakcje w okolicach godziny 13:00 – jest to odpowiednio 20 i 25 sekund dla PGE i PGNIG. 
+
+
+## Elastyczna forma Fouriera
+
+Kolejnym etapem badania było usunięcie śróddziennej sezonowości z szeregu transakcyjnych czasów trwania za pomocą elastycznej formy Fouriera). 
+
+Na podstawie składowej sezonowej dla spółki PGE można zauważyć, iż wzorzec dla poszczególnych dni jest podobny, tzn. czas trwania jest najkrótszy w ciągu pierwszej i ostatniej godziny sesji giełdowej. Natomiast najdłuższe transakcyjne czasy trwania są od godziny 11:00 do 14:00 dla wszystkich dni tygodnia. Porównując ze sobą poszczególne dni można zauważyć, że czasy trwania dla tych samych godzin są najkrótsze w środy, a najdłuższe w poniedziałki. 
+
+```{r echo=TRUE, fig.align='center', message=FALSE, warning=FALSE, out.width="60%", results='hide', fig.keep='all'}
+df_pge_FFF <- diurnalAdj(df_pge_time_duration, method = "FFF", aggregation = "weekdays")
+df_pge_FFF 
+```
+
+Posługując się składową sezonową dla spółki PGNiG można wyciągnąć podobne wnioski jak dla spółki PGE, jeśli chodzi o wzorzec dla poszczególnych dni i podobny trend w zależności od pory (godziny) dnia. Natomiast widoczna jest różnica w czasach trwania od godziny 11:00 do 14:00 – we wtorki i piątki czasy trwania są dłuższe, niż w pozostałe dni, zwłaszcza środy.
+
+```{r echo=TRUE, fig.align='center', message=FALSE, warning=FALSE, out.width="60%", results='hide', fig.keep='all'}
+df_pgnig_FFF <- diurnalAdj(df_pgnig_time_duration, method = "FFF", aggregation = "weekdays")
+df_pgnig_FFF
+```
+
+Po usunięciu śróddziennej sezonowości z szeregu transakcyjnych czasów trwania wyznaczono przekrojowe średnie czasów trwania. Można stwierdzić, iż zastosowana metoda - elastyczna forma Fouriera - spowodowała skuteczne usunięcie sezonowości. Trudno zauważyć znaczące różnice pomiędzy czasami trwania w różnych porach dnia. 
+
+```{r echo=TRUE, fig.align='center', message=FALSE, warning=FALSE, out.width="75%", results='hide', fig.keep='all'}
+df_pge_time_duration_means_FFF <- df_pge_FFF %>% group_by(Interval) %>%
+  summarise(MeanTimeDurations = sum(adjDur) / sum(Ntrans))
+df_pgnig_time_duration_means_FFF <- df_pgnig_FFF %>% group_by(Interval) %>%
+  summarise(MeanTimeDurations = sum(adjDur) / sum(Ntrans))
+
+df_pge_time_duration_means_FFF["name"] <- 'PGE'
+df_pgnig_time_duration_means_FFF["name"] <- 'PGNIG'
+df_time_duration_means_FFF <- rbind(df_pge_time_duration_means_FFF, df_pgnig_time_duration_means_FFF)
+
+df_time_duration_means_FFF %>%
+  ggplot(aes(x = Interval, y = MeanTimeDurations, group = name, color = name)) +
+  geom_line() + 
+  ggtitle("Średni transakcyjny czas trwania po zastosowaniu \nelastycznej formy Fouriera") + 
+  xlab("Godzina") + 
+  ylab("Czas trwania [sek.]") + 
+  labs(color="Spółka") +
+  geom_hline(yintercept=0, linetype="solid", color = "black", alpha=0.5) +
+  scale_x_discrete(breaks = c('10:00:00', '12:00:00', '14:00:00', '16:00:00')) + 
+  theme_bw() + 
+  theme(legend.position = "none") +
+  facet_grid(factor(name)~.)
+```
+
+-----
+
+# Cenowe czasy trwania
+
+Cenowy czasy trwania, czyli czas jaki mija od zawarcia jednej transakcji po danej cenie do kolejnej transakcji po innej cenie. Warto podkreślić, że w badanym okresie minimalna wielkość zmiany ceny (krok notowania) dla obu badanych spółek to 0,01 PLN. 
+
+W przypadku PGE średni cenowy czas trwania dochodzi nawet do 3 500 sekund (czyli prawie godzina) w okolicach godziny 13:00. Najkrótsze cenowe czasy trwania dla tej spółki są zaraz po otwarciu, jak również pod koniec sesji. W przypadku PGNiG można zauważyć, że cena zmienia się rzadziej – średni czas trwania ceny bywa nawet kilkukrotnie dłuższy niż w przypadku PGE. 
+
+W przypadku różnicy w cenie równiej 0,01 PLN średni cenowy czas trwania dla pierwszych 5 minut sesji to około 25 sekund – dla obu badanych spółek. Oznacza to, że między godziną 9:00 a 9:05 cena zmienia się o minimum 0,01 PLN średnio co 25 sekund. 
+
+Warto również zaznaczyć różnice pomiędzy wynikami badań w zależności od przyjętej różnicy w cenie – 0,01 lub 0,05 PLN. Średnie czasy trwania ceny dla 0,01 PLN są kilka bądź kilkanaście razy krótsze niż czasy te dla 0,05 PLN, tzn. zmiany ceny pomiędzy cenami kolejnych transakcji o wiele częściej różnią się o 0,01 PLN, a liczba gwałtowniejszych skoków – o 0,05 PLN jest rzadsza. 
+
+```{r echo=TRUE, fig.align='center', message=FALSE, warning=FALSE, out.width="75%", results='hide', fig.keep='all'}
+df_pge_price_duration_01 <- computeDurations(df_pge, open = "09:00:00", close = "16:49:59", 
+                                             rm0dur = TRUE, type = "price", priceDiff = 0.01)
+df_pge_price_duration_05 <- computeDurations(df_pge, open = "09:00:00", close = "16:49:59", 
+                                             rm0dur = TRUE, type = "price", priceDiff = 0.05)
+df_pgnig_price_duration_01 <- computeDurations(df_pgnig, open = "09:00:00", close = "16:49:59", 
+                                             rm0dur = TRUE, type = "price", priceDiff = 0.01)
+df_pgnig_price_duration_05 <- computeDurations(df_pgnig, open = "09:00:00", close = "16:49:59", 
+                                             rm0dur = TRUE, type = "price", priceDiff = 0.05)
+
+compute_price_duration_means <- function(df, priceDiff = 0.01, name){
+  df["Interval"] <- floor_date(df$time, unit = "5 min")
+  df["Interval"] <- str_sub(as.character(df$Interval), -8, -1)
+  df <- df %>% group_by(Interval) %>%
+    summarise(MeanTimeDurations = mean(durations))
+  df["name"] <- as.factor(name)
+  df["priceDiff"] <- as.factor(priceDiff)
+  return(df)
+}
+
+df_pge_price_duration_01_means <- compute_price_duration_means(df_pge_price_duration_01, 0.01, "PGE")
+df_pge_price_duration_05_means <- compute_price_duration_means(df_pge_price_duration_05, 0.05, "PGE")
+df_pgnig_price_duration_01_means <- compute_price_duration_means(df_pgnig_price_duration_01, 0.01, "PGNIG")
+df_pgnig_price_duration_05_means <- compute_price_duration_means(df_pgnig_price_duration_05, 0.05, "PGNIG")
+
+df_time_duration_means_FFF <- rbind(df_pge_price_duration_01_means, df_pge_price_duration_05_means,
+                                    df_pgnig_price_duration_01_means, df_pgnig_price_duration_05_means)
+
+df_time_duration_means_FFF %>%
+  ggplot(aes(x = Interval, y = MeanTimeDurations, group = as.factor(priceDiff), color = as.factor(priceDiff))) +
+  geom_line() + 
+  ggtitle("Cenowe czasy trwania") + 
+  xlab("Godzina") + 
+  ylab("Czas trwania [sek.]") + 
+  labs(color="Różnica w cenie [PLN]") +
+  scale_x_discrete(breaks = c('10:00:00', '12:00:00', '14:00:00', '16:00:00')) + 
+  theme_bw() + 
+  facet_grid(name~., scale = "free_y")
+```
+
+-----
+
+# Podsumowanie
+
+W pracy przeanalizowano transakcyjne i cenowe czasy trwania dla dwóch spółek akcyjnych: PGE i PGNiG, ze szczególnych uwzględnieniem występowania śróddziennej sezonowości. 
+
+W przypadku transakcyjnych czasów trwania można było zauważyć śróddzienną sezonowość, czasy trwania były znacznie krótsze na początku i na końcu sesji giełdowej. Różnice pomiędzy czasami podczas pierwszej i ostatniej godziny sesji, a czasami od godziny 11:00 do 13:00 były nawet kilkukrotne. W kolejnym kroku badania usunięto sezonowość z szeregu transakcyjnych czasów trwania za pomocą elastycznej formy Fouriera. Po tym zabiegu średni elastyczny czas trwania przestał wykazywać cechy śróddziennej sezonowości. 
+
+Wyznaczono i porównano również zależności dla cenowych czasów trwania przy dwóch ustalonych progach cenowych równych 0,01 PLN i 0,05 PLN. Przede wszystkim można było zauważyć, że w przypadku PGNiG cena zmienia się rzadziej – średni czas trwania ceny bywa nawet kilkukrotnie dłuższy niż w przypadku PGE. Ponadto, zmiany ceny pomiędzy cenami kolejnych transakcji o wiele częściej różnią się o 0,01 PLN, a liczba gwałtowniejszych skoków  o 0,05 PLN jest wiele rzadsza.
+
+-----
